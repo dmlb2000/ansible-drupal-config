@@ -1,0 +1,9 @@
+---
+- hosts: localhost
+  tasks:
+    - name: Set Defaut Theme
+      drupal_config:
+        id: system.theme
+        root: /var/www/drupalvm/drupal
+        config:
+          default: seven
