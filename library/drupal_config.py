@@ -1,4 +1,5 @@
-#!/usr/bin/python3
+#!/usr/bin/python
+from __future__ import print_function
 
 ANSIBLE_METADATA = {
     'metadata_version': '0.1',
@@ -63,55 +64,63 @@ config:
     returned: always
 '''
 from io import StringIO
-from subprocess import Popen, PIPE
+from subprocess import call
 try:
     from tempfile import TemporaryDirectory
 except ImportError:
     from backports.tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile
+import traceback
 import os, sys
 from yaml import load, dump
 try:
     from yaml import CLoader as Loader, CDumper as Dumper
 except ImportError:
     from yaml import Loader, Dumper
-from jinja2 import Template
+from jinja2 import Environment, DictLoader
+try:
+    import json
+except ImportError:
+    import simplejson as json
 from ansible.module_utils.basic import AnsibleModule
+from ansible.plugins.filter.core import FilterModule
 
 class DrushException(Exception):
     pass
 
-def _call(args, stdout, stderr):
-    with open()
+def _call(args, cwd):
+    with NamedTemporaryFile(mode='rw') as stderr_fd:
+        with NamedTemporaryFile(mode='rw') as stdout_fd:
+            rc = call(args, stdout=stdout_fd, stderr=stderr_fd, cwd=cwd, shell=True)
+            stdout_fd.seek(0)
+            stderr_fd.seek(0)
+            return rc, stdout_fd.read(), stderr_fd.read()
+
 
 def _drupal_strip_config(yaml_data):
     for key in ['_core']:
         del yaml_data[key]
     return yaml_data
 
-def _drush_set(drush_path, root, config_id, config_data):
-    stdout_buf = StringIO()
-    stderr_buf = StringIO()
+def _drush_set(module, config_data):
     with TemporaryDirectory() as temp_dir:
         with open(os.path.join(temp_dir, '{}.yml'.format(config_id)), 'w') as config_fd:
             config_fd.write(dump(config_data, Dumper=Dumper))
-        if call([drush_path, '--yes', '--root', root, 'config:import', '--partial', '--source', temp_dir], stdout=stdout_buf, stderr=stderr_buf) != 0:
-            stderr_buf.seek(0)
-            raise DrushException('Config import failed {}'.format(stderr_buf.read()))
+        args = '{} --yes cim --partial --source {}'.format(module.params['drush_path'], temp_dir)
+        rc, stdout, stderr = _call(args, cwd=module.params['root'])
+        if rc != 0:
+            raise DrushException('Config import failed {}\n{}'.format(stderr, traceback.format_exc()))
     
 
-def _drush_get(drush_path, root, config_id):
-    stdout_buf = StringIO()
-    stderr_buf = StringIO()
-    if call([drush_path, '--yes', '--root', root, 'config:get', config_id], stdout=stdout_buf, stderr=stderr_buf) != 0:
-        stderr_buf.seek(0)
-        if 'Config {} does not exist'.format(config_id) in stderr_buf.read():
-            return None
-        stderr_buf.seek(0)
-        raise DrushException('Some other Drush exception happened {}'.format(stderr_buf.read()))
-    stdout_buf.seek(0)
-    yaml_data = load(stdout_buf.read(), Loader=Loader)
-    stdout_buf.seek(0)
-    clean_data = _drupal_strip_config(load(stdout_buf.read(), Loader=Loader))
+def _drush_get(module):
+    args = '{} cget {}'.format(module.params['drush_path'], module.params['id'])
+    rc, stdout, stderr = _call(args, cwd=module.params['root'])
+    if rc != 0:
+        if 'Config {} does not exist'.format(config_id) in stderr:
+            return None, None
+        raise DrushException('Error executing {};\n{}\n{}\n'.format(' '.join(args), stderr, stdout))
+    yaml_data = load(stdout, Loader=Loader)
+    clean_data = _drupal_strip_config(load(stdout, Loader=Loader))
     return yaml_data, clean_data
 
 def run_module():
@@ -136,16 +145,18 @@ def run_module():
     )
 
     try:
-        yaml_data, clean_data = _drush_get(module.params['drush_path'], module.params['root'], module.params['id'])
+        yaml_data, clean_data = _drush_get(module)
     except DrushException:
-        module.fail_json(msg='{0}\n{1}\n{2}\n'.format(*sys.exc_info()), **result)
+        module.fail_json(msg=traceback.format_exc(), **result)
     result['old_config'] = yaml_data
 
     if module.check_mode:
         module.exit_json(**result)
 
     if module.params['merge']:
-        t = Template("{{ old_config | combine(config, recursive=True) }}!")
+        e = Environment(DictLoader({'config_merge': '{{ old_config | combine(config, recursive=True) }}'}))
+        e.filters = FilterModule().filters()
+        t = e.get_template('config_merge')
         new_data = load(t.render(old_config=clean_data, config=module.params['config']), Loader=Loader)
     else:
         new_data = module.params['config']
@@ -161,7 +172,7 @@ def run_module():
 
     result['changed'] = True
     try:
-        _drush_set(module.params['drush_path'], module.params['root'], module.params['id'], new_data)
+        _drush_set(module, new_data)
     except DrushException:
         module.fail_json(msg='{0}\n{1}\n{2}\n'.format(*sys.exc_info()), **result)
     
