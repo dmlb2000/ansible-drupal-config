@@ -82,15 +82,16 @@ try:
     import json
 except ImportError:
     import simplejson as json
+import ansible.module_utils.common.json
 from ansible.module_utils.basic import AnsibleModule
-from ansible.plugins.filter.core import FilterModule
+from ansible.plugins.filter.core import combine
 
 class DrushException(Exception):
     pass
 
 def _call(args, cwd):
-    with NamedTemporaryFile(mode='rw') as stderr_fd:
-        with NamedTemporaryFile(mode='rw') as stdout_fd:
+    with NamedTemporaryFile(mode='r+') as stderr_fd:
+        with NamedTemporaryFile(mode='r+') as stdout_fd:
             rc = call(args, stdout=stdout_fd, stderr=stderr_fd, cwd=cwd, shell=True)
             stdout_fd.seek(0)
             stderr_fd.seek(0)
@@ -99,12 +100,19 @@ def _call(args, cwd):
 
 def _drupal_strip_config(yaml_data):
     for key in ['_core']:
-        del yaml_data[key]
+        if key in yaml_data:
+            del yaml_data[key]
     return yaml_data
+
+def _restore_strip_config(new_data, orig_data):
+    for key in ['_core']:
+        if key in orig_data:
+            new_data[key] = orig_data[key]
+    return new_data
 
 def _drush_set(module, config_data):
     with TemporaryDirectory() as temp_dir:
-        with open(os.path.join(temp_dir, '{}.yml'.format(config_id)), 'w') as config_fd:
+        with open(os.path.join(temp_dir, '{}.yml'.format(module.params['id'])), 'w') as config_fd:
             config_fd.write(dump(config_data, Dumper=Dumper))
         args = '{} --yes cim --partial --source {}'.format(module.params['drush_path'], temp_dir)
         rc, stdout, stderr = _call(args, cwd=module.params['root'])
@@ -116,12 +124,12 @@ def _drush_get(module):
     args = '{} cget {}'.format(module.params['drush_path'], module.params['id'])
     rc, stdout, stderr = _call(args, cwd=module.params['root'])
     if rc != 0:
-        if 'Config {} does not exist'.format(config_id) in stderr:
+        if 'Config {} does not exist'.format(module.params['id']) in stderr:
             return None, None
         raise DrushException('Error executing {};\n{}\n{}\n'.format(' '.join(args), stderr, stdout))
-    yaml_data = load(stdout, Loader=Loader)
+    orig_data = load(stdout, Loader=Loader)
     clean_data = _drupal_strip_config(load(stdout, Loader=Loader))
-    return yaml_data, clean_data
+    return orig_data, clean_data
 
 def run_module():
     # define available arguments/parameters a user can pass to the module
@@ -145,19 +153,16 @@ def run_module():
     )
 
     try:
-        yaml_data, clean_data = _drush_get(module)
+        orig_data, clean_data = _drush_get(module)
     except DrushException:
         module.fail_json(msg=traceback.format_exc(), **result)
-    result['old_config'] = yaml_data
+    result['old_config'] = orig_data
 
     if module.check_mode:
         module.exit_json(**result)
 
     if module.params['merge']:
-        e = Environment(DictLoader({'config_merge': '{{ old_config | combine(config, recursive=True) }}'}))
-        e.filters = FilterModule().filters()
-        t = e.get_template('config_merge')
-        new_data = load(t.render(old_config=clean_data, config=module.params['config']), Loader=Loader)
+        new_data = combine(clean_data, module.params['config'], recursive=True)
     else:
         new_data = module.params['config']
 
@@ -167,10 +172,12 @@ def run_module():
     new_str = dump(new_data, **dump_args)
     old_str = dump(clean_data, **dump_args)
     if new_str == old_str:
-        result['config'] = new_data
+        result['config'] = orig_data
         module.exit_json(**result)
 
     result['changed'] = True
+    new_data = _restore_strip_config(new_data, orig_data)
+    result['config'] = new_data
     try:
         _drush_set(module, new_data)
     except DrushException:
